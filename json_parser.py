@@ -1,237 +1,205 @@
+
 import json
 import re
-from typing import Any, Dict, List, Union, Optional, Tuple
 from enum import Enum
+from typing import Any
 
 class ParseState(Enum):
     NORMAL = "normal"
     IN_STRING = "in_string"
-    IN_KEY = "in_key"
     ESCAPE = "escape"
-    IN_COMMENT_LINE = "in_comment_line"
-    IN_COMMENT_BLOCK = "in_comment_block"
 
 def from_str(input_str: str) -> Any:
     """
-    Parse a string (potentially from LLM response) into JSON.
-    Handles multiple fallback strategies for malformed JSON.
-    
-    Args:
-        input_str: The raw string to parse (e.g., LLM response)
-        
-    Returns:
-        Parsed JSON object (dict, list, or primitive)
+    Parse a string (potentially from an LLM response) into JSON.
+    Heuristics:
+      - Parse normal JSON
+      - Extract/parse ```...``` blocks
+      - Find/parse all {...}/[...] substrings
+      - Fix malformed JSON (comments, single quotes, unquoted keys/values,
+        numbers starting with '.', trailing/leading commas, balance braces/brackets)
+      - If the whole payload is a quoted JSON blob, unquote+unescape then parse
+      - Quote complex expression-like values (e.g., 314.97 + 1.32)
     """
     if not input_str or not input_str.strip():
         return None
-    
-    # Strategy 1: Try standard JSON parsing
+    raw = input_str.strip()
+
+    # Strategy 0: whole payload is quoted -> unquote + unescape + parse
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+        inner = raw[1:-1]
+        try:
+            inner = bytes(inner, "utf-8").decode("unicode_escape")
+        except Exception:
+            pass
+        inner = inner.strip()
+        if inner.startswith("{") or inner.startswith("["):
+            fixed_inner = _fix_malformed_json(inner)
+            try:
+                return json.loads(fixed_inner)
+            except json.JSONDecodeError:
+                pass  # fall through
+
+    # Strategy 1: Try straightforward JSON parsing
     try:
-        return json.loads(input_str)
+        return json.loads(raw)
     except json.JSONDecodeError:
         pass
-    
-    # Strategy 2: Extract from markdown code blocks
-    markdown_json = extract_from_markdown(input_str)
-    if markdown_json:
+
+    # Strategy 2: Extract and parse all code-block JSON (```json ... ```)
+    md_pattern = r"```(?:\w*\s*)?\n(.*?)\n```"
+    md_blocks = re.findall(md_pattern, raw, flags=re.DOTALL)
+    md_results = []
+    for blk in md_blocks:
+        blk = blk.strip()
         try:
-            return json.loads(markdown_json)
+            md_results.append(json.loads(blk))
+            continue
         except json.JSONDecodeError:
-            pass
-    
-    # Strategy 3: Find JSON objects/arrays in text
-    json_objects = extract_json_objects(input_str)
-    if json_objects:
-        # Try to parse each found object
-        for obj_str in json_objects:
+            fixed_blk = _fix_malformed_json(blk)
             try:
-                return json.loads(obj_str)
+                md_results.append(json.loads(fixed_blk))
             except json.JSONDecodeError:
-                # Try fixing malformed JSON
-                fixed = fix_malformed_json(obj_str)
-                try:
-                    return json.loads(fixed)
-                except json.JSONDecodeError:
-                    continue
-    
-    # Strategy 4: Fix malformed JSON on entire input
-    fixed = fix_malformed_json(input_str.strip())
+                pass
+    if md_results:
+        return md_results[0] if len(md_results) == 1 else md_results
+
+    # Strategy 3: Find and parse all JSON objects/arrays in the text
+    objs = _extract_json_objects(raw)
+    obj_results = []
+    for s in objs:
+        try:
+            obj_results.append(json.loads(s))
+            continue
+        except json.JSONDecodeError:
+            fixed = _fix_malformed_json(s)
+            try:
+                obj_results.append(json.loads(fixed))
+            except json.JSONDecodeError:
+                pass
+    if obj_results:
+        return obj_results[0] if len(obj_results) == 1 else obj_results
+
+    # Strategy 4: Fix malformed JSON on the entire input
+    fixed = _fix_malformed_json(raw)
     try:
         return json.loads(fixed)
     except json.JSONDecodeError:
-        pass
-    
-    # Strategy 5: Return as string if all else fails
-    return input_str.strip()
+        return raw  # last resort: return original string
 
-def extract_from_markdown(text: str) -> Optional[str]:
-    """Extract JSON from markdown code blocks."""
-    # Look for ```json blocks
-    pattern = r'```(?:json)?\s*\n(.*?)\n```'
-    matches = re.findall(pattern, text, re.DOTALL)
-    if matches:
-        return matches[0].strip()
-    return None
-
-def extract_json_objects(text: str) -> List[str]:
-    """Extract potential JSON objects or arrays from text."""
+def _extract_json_objects(text: str) -> list[str]:
+    """Find all balanced {...} and [...] substrings in text."""
     results = []
-    
-    # Find all potential JSON starts
-    for i, char in enumerate(text):
-        if char in ['{', '[']:
-            # Try to find matching closing bracket
-            end_idx = find_matching_bracket(text, i)
-            if end_idx != -1:
-                potential_json = text[i:end_idx + 1]
-                results.append(potential_json)
-    
-    return results
-
-def find_matching_bracket(text: str, start_idx: int) -> int:
-    """Find the matching closing bracket for a JSON object/array."""
-    if start_idx >= len(text):
-        return -1
-    
-    open_char = text[start_idx]
-    close_char = '}' if open_char == '{' else ']'
-    
-    count = 1
+    stack = []
+    start = None
     in_string = False
     escape = False
-    
-    for i in range(start_idx + 1, len(text)):
-        char = text[i]
-        
+    for i, ch in enumerate(text):
         if escape:
             escape = False
             continue
-            
-        if char == '\\':
+        if ch == "\\":
             escape = True
             continue
-            
-        if char == '"' and not in_string:
-            in_string = True
-        elif char == '"' and in_string:
-            in_string = False
-        elif not in_string:
-            if char == open_char:
-                count += 1
-            elif char == close_char:
-                count -= 1
-                if count == 0:
-                    return i
-    
-    return -1
-
-def fix_malformed_json(text: str) -> str:
-    """
-    Fix common JSON formatting issues in LLM responses.
-    Handles unquoted strings, single quotes, trailing commas, etc.
-    """
-    # Remove comments
-    text = remove_comments(text)
-    
-    # State machine for parsing
-    result = []
-    state = ParseState.NORMAL
-    buffer = ""
-    i = 0
-    bracket_stack = []
-    
-    while i < len(text):
-        char = text[i]
-        
-        if state == ParseState.ESCAPE:
-            result.append(char)
-            state = ParseState.IN_STRING
-            i += 1
+        if ch == '"':
+            in_string = not in_string
             continue
-        
-        if state == ParseState.IN_STRING:
-            if char == '\\':
-                result.append(char)
-                state = ParseState.ESCAPE
-            elif char == '"':
-                result.append(char)
-                state = ParseState.NORMAL
-            else:
-                result.append(char)
-            i += 1
+        if in_string:
             continue
-        
-        # Normal state
-        if char == '"':
-            result.append(char)
-            state = ParseState.IN_STRING
-        elif char == "'":
-            # Convert single quotes to double quotes
-            result.append('"')
-            i += 1
-            # Find closing single quote
-            while i < len(text) and text[i] != "'":
-                if text[i] == '"':
-                    result.append('\\"')
+        if ch in "{[":
+            if not stack:
+                start = i
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                open_br = stack.pop()
+                if (open_br == '{' and ch == '}') or (open_br == '[' and ch == ']'):
+                    if not stack and start is not None:
+                        results.append(text[start:i+1])
+                        start = None
                 else:
-                    result.append(text[i])
-                i += 1
-            result.append('"')
-        elif char in ['{', '[']:
-            result.append(char)
-            bracket_stack.append(char)
-        elif char in ['}', ']']:
-            # Remove trailing comma if present
-            j = len(result) - 1
-            while j >= 0 and result[j] in [' ', '\n', '\t']:
-                j -= 1
-            if j >= 0 and result[j] == ',':
-                result = result[:j] + result[j+1:]
-            result.append(char)
-            if bracket_stack and ((char == '}' and bracket_stack[-1] == '{') or 
-                                 (char == ']' and bracket_stack[-1] == '[')):
-                bracket_stack.pop()
-        elif char == ':':
-            # Check if we need to quote the key
-            j = len(result) - 1
-            while j >= 0 and result[j] in [' ', '\n', '\t']:
-                j -= 1
-            
-            # If the previous non-whitespace char is not a quote, we need to quote the key
-            if j >= 0 and result[j] != '"':
-                # Find the start of the key
-                key_end = j + 1
-                while j >= 0 and result[j] not in [',', '{', '[', '\n']:
-                    j -= 1
-                key_start = j + 1
-                
-                # Extract and quote the key
-                key = ''.join(result[key_start:key_end]).strip()
-                result = result[:key_start] + ['"', key, '"'] + result[key_end:]
-            
-            result.append(char)
-        else:
-            result.append(char)
-        
-        i += 1
-    
-    # Close any unclosed brackets
-    while bracket_stack:
-        bracket = bracket_stack.pop()
-        if bracket == '{':
-            result.append('}')
-        else:
-            result.append(']')
-    
-    return ''.join(result)
+                    stack.clear()
+                    start = None
+    if stack and start is not None:
+        results.append(text[start:])
+    return results
 
-def remove_comments(text: str) -> str:
-    """Remove both line and block comments from text."""
-    # Remove line comments
-    text = re.sub(r'//.*?$', '', text, flags=re.MULTILINE)
-    # Remove block comments
-    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+def _fix_malformed_json(text: str) -> str:
+    """
+    Repair common JSON issues:
+      - remove comments
+      - Python True/False/None -> JSON true/false/null
+      - numbers starting with '.'
+      - single quotes -> double quotes
+      - quote unquoted keys and bareword values (but not literals/numbers)
+      - quote complex unquoted expressions (e.g., '314.97 + 1.32')
+      - remove trailing/leading commas
+      - balance braces/brackets with a stack
+    """
+    # 1) Remove comments
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+
+    # 2) Python literals
+    text = re.sub(r"\bTrue\b", "true", text)
+    text = re.sub(r"\bFalse\b", "false", text)
+    text = re.sub(r"\bNone\b", "null", text)
+
+    # 3) Numbers starting with '.'
+    text = re.sub(r"(?<=[:\s\[,])\.(\d+)", r"0.\1", text)
+
+    # 4) Single-quoted strings -> double-quoted
+    def _convert_single(m: re.Match) -> str:
+        inner = m.group(1).replace('"', '\\"')
+        return '"' + inner + '"'
+    text = re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", _convert_single, text)
+
+    # 5) Quote unquoted keys
+    key_pattern = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
+    text = key_pattern.sub(r'\1"\2"\3', text)
+
+    # 6) Quote unquoted bareword values (not literals or numbers)
+    def _quote_bareword_value(m: re.Match) -> str:
+        prefix, value = m.group(1), m.group(2)
+        if value in {"true", "false", "null"} or re.fullmatch(r"-?\d+(\.\d+)?([eE][+\-]?\d+)?", value):
+            return prefix + value
+        return f'{prefix}"{value}"'
+    val_pattern = re.compile(r'(:\s*)([A-Za-z_][A-Za-z0-9_]*)(?=[,\}\]])')
+    text = val_pattern.sub(_quote_bareword_value, text)
+
+    # 6b) Quote complex unquoted expressions appearing as values
+    def _quote_expression(m: re.Match) -> str:
+        prefix, value = m.group(1), m.group(2)
+        v = value.strip()
+        # skip if already quoted/object/array
+        if v.startswith(('"', "'", "{", "[")):
+            return prefix + value
+        # JSON literals or numbers -> leave
+        if v in {"true", "false", "null"} or re.fullmatch(r"-?\d+(\.\d+)?([eE][+\-]?\d+)?", v):
+            return prefix + v
+        v = v.replace('"', '\\"')
+        return f'{prefix}"{v}"'
+    expr_pattern = re.compile(r'(:\s*)([^,\}\]]+)(?=\s*[,\}\]])')
+    text = expr_pattern.sub(_quote_expression, text)
+
+    # 7) Remove dangling commas
+    text = re.sub(r",\s*([\}\]])", r"\1", text)
+    text = re.sub(r"([\{\[])\s*,\s*", r"\1", text)
+
+    # 8) Balance brackets with a stack
+    stack = []
+    for ch in text:
+        if ch == '{':
+            stack.append('}')
+        elif ch == '[':
+            stack.append(']')
+        elif ch == '}' and stack and stack[-1] == '}':
+            stack.pop()
+        elif ch == ']' and stack and stack[-1] == ']':
+            stack.pop()
+    text += ''.join(reversed(stack))
     return text
+
 
 # Example usage and test cases
 if __name__ == "__main__":
@@ -239,41 +207,103 @@ if __name__ == "__main__":
     test_cases = [
         # Standard JSON
         '{"name": "John", "age": 30}',
-        
+
         # JSON in markdown
-        '''Here's the result:
+        """Here's the result:
         ```json
         {"status": "success", "data": [1, 2, 3]}
         ```
-        ''',
-        
+        """,
+
         # Malformed JSON with single quotes
         "{'name': 'John', 'age': 30}",
-        
+
         # Unquoted keys
         "{name: 'John', age: 30, active: true}",
-        
+
         # Trailing commas
         '{"items": [1, 2, 3,], "total": 3,}',
-        
+
         # Mixed content with JSON
         "The user data is {name: John, scores: [95, 87, 92]} as shown above.",
-        
+
         # Incomplete JSON (streaming)
         '{"status": "processing", "items": [1, 2',
-        
+
         # Comments in JSON
-        '''{
+        """{
             // User information
             "name": "John", // Full name
             /* Age in years */
             "age": 30
-        }''',
+        }""",
+
+        """
+        "{\n  \"intent\": \"divide\",\n  \"reasoning\": \"Now I need to perform the division.\",\n  \"numerator\": 314.97 + 1.32,\n  \"denominator\": 15.152\n}"
+        
+        """,
+        # Markdown block with non-"json" tag
+        """```test json
+        {"a": 1, "b": 2}
+        ```""",
+
+        # Leading comma in array
+        '{"a": [,1,2,3]}',
+
+        # Numbers starting with a dot
+        '{"a": .5, "b": [.1, .2]}',
+
+        # Python True/False/None
+        '{"ok": True, "flag": False, "data": None}',
+
+        # Unquoted values with hyphen and slash (date/path)
+        '{"date": 2024-01-02, "path": C:/Users/John}',
+
+        # Scientific notation numbers
+        '{"eps": 1e-3, "nums": [2E3, -3.5e+2]}',
+
+        # Nested trailing commas (object + array)
+        '{"list":[{"a":1}, {"b":2},],}',
+
+        # Garbage before/after JSON + comments + trailing comma
+        "blah { a: 1, /*c*/ b: 2, } trailing",
+
+        # Unterminated array with nested objects (streaming)
+        '{"a":[{"x":1}, {"y":2}',
+
+        # Whole payload quoted with single quotes
+        "'{\"city\": \"MTL\", \"ok\": true}'",
+
+        # Uppercase bareword booleans -> should become strings
+        '{"active": TRUE, "off": FALSE}',
+
+        # URL and email as unquoted values -> should be quoted strings
+        '{"url": https://example.com, "email": test@example.com}',
+
+        # Expression value with parentheses -> should be quoted
+        '{"expr": (1+2)}',
+
+        # Markdown block with extra spaces in tag
+        """```json   
+        {"alpha": 1, "beta": 2}
+        ```""",
+
+        # Mixed content; first balanced object should be parsed
+        "Intro text... {name: Alice, score: 42, done: false}, more text",
+
+        # Array value with leading comma inside nested structure
+        '{"outer": {"arr": [,10,20]}}',
+
     ]
-    
+
     for i, test in enumerate(test_cases):
         print(f"\nTest {i + 1}:")
         print(f"Input: {test}")
         result = from_str(test)
         print(f"Output: {result}")
         print(f"Type: {type(result)}")
+        assert isinstance(result, dict), (
+            f"Test {i + 1} failed: expected dict but got {type(result)}. Parsed value: {result}"
+        )
+        print("Type assertion passed (dict).")
+
