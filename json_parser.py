@@ -26,19 +26,30 @@ def from_str(input_str: str) -> Any:
     raw = input_str.strip()
 
     # Strategy 0: whole payload is quoted -> unquote + unescape + parse
-    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
-        inner = raw[1:-1]
-        try:
-            inner = bytes(inner, "utf-8").decode("unicode_escape")
-        except Exception:
-            pass
+    # First check if the string after stripping whitespace starts and ends with quotes
+    stripped_for_quote_check = raw.strip()
+    if len(stripped_for_quote_check) >= 2 and stripped_for_quote_check[0] == stripped_for_quote_check[-1] and stripped_for_quote_check[0] in {'"', "'"}:
+        inner = stripped_for_quote_check[1:-1]
+        # Handle escaped quotes in the inner content
+        if stripped_for_quote_check[0] == '"':
+            inner = inner.replace('\\"', '"')
+        elif stripped_for_quote_check[0] == "'":
+            inner = inner.replace("\\'", "'")
         inner = inner.strip()
         if inner.startswith("{") or inner.startswith("["):
-            fixed_inner = _fix_malformed_json(inner)
+            # Try to parse as-is first
             try:
-                return json.loads(fixed_inner)
+                return json.loads(inner)
             except json.JSONDecodeError:
-                pass  # fall through
+                # If that fails, try fixing malformed JSON
+                fixed_inner = _fix_malformed_json(inner)
+                try:
+                    return json.loads(fixed_inner)
+                except json.JSONDecodeError as e:
+                    # Debug: print what went wrong
+                    # print(f"Failed to parse fixed JSON: {e}")
+                    # print(f"Fixed JSON was: {fixed_inner}")
+                    pass  # fall through
 
     # Strategy 1: Try straightforward JSON parsing
     try:
@@ -136,57 +147,65 @@ def _fix_malformed_json(text: str) -> str:
       - remove trailing/leading commas
       - balance braces/brackets with a stack
     """
-    # 1) Remove comments
-    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    # 1) Remove comments (but be careful about URLs with //)
+    # Only remove // comments if they're not part of a URL (no : before //)
+    text = re.sub(r"(?<!:)//.*?$", "", text, flags=re.MULTILINE)
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
 
-    # 2) Python literals
-    text = re.sub(r"\bTrue\b", "true", text)
-    text = re.sub(r"\bFalse\b", "false", text)
-    text = re.sub(r"\bNone\b", "null", text)
-
-    # 3) Numbers starting with '.'
+    # 2) Numbers starting with '.'
     text = re.sub(r"(?<=[:\s\[,])\.(\d+)", r"0.\1", text)
 
-    # 4) Single-quoted strings -> double-quoted
+    # 3) Single-quoted strings -> double-quoted
     def _convert_single(m: re.Match) -> str:
         inner = m.group(1).replace('"', '\\"')
         return '"' + inner + '"'
     text = re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", _convert_single, text)
 
-    # 5) Quote unquoted keys
+    # 4) Quote unquoted keys
     key_pattern = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
     text = key_pattern.sub(r'\1"\2"\3', text)
 
-    # 6) Quote unquoted bareword values (not literals or numbers)
-    def _quote_bareword_value(m: re.Match) -> str:
-        prefix, value = m.group(1), m.group(2)
-        if value in {"true", "false", "null"} or re.fullmatch(r"-?\d+(\.\d+)?([eE][+\-]?\d+)?", value):
+    # 5) Quote unquoted values - improved regex approach
+    def _quote_value(m: re.Match) -> str:
+        prefix, value = m.group(1), m.group(2).strip()
+        
+        # Skip if already quoted or is object/array
+        if value.startswith(('"', "'", "{", "[")):
+            return prefix + m.group(2)
+        
+        # Special case for uppercase TRUE/FALSE (should be strings not booleans)
+        if value in {"TRUE", "FALSE"}:
+            return prefix + f'"{value}"'
+        
+        # Python True/False/None -> JSON true/false/null
+        if value == "True":
+            return prefix + "true"
+        elif value == "False":
+            return prefix + "false"
+        elif value == "None":
+            return prefix + "null"
+        
+        # JSON literals (lowercase)
+        if value in {"true", "false", "null"}:
             return prefix + value
+        
+        # Numbers (including scientific notation)
+        if re.fullmatch(r"-?\d+(\.\d+)?([eE][+\-]?\d+)?", value):
+            return prefix + value
+        
+        # Quote everything else (URLs, emails, expressions, etc.)
+        value = value.replace('"', '\\"')
         return f'{prefix}"{value}"'
-    val_pattern = re.compile(r'(:\s*)([A-Za-z_][A-Za-z0-9_]*)(?=[,\}\]])')
-    text = val_pattern.sub(_quote_bareword_value, text)
+    
+    # Match any value after : until we hit a comma, closing bracket/brace
+    val_pattern = re.compile(r'(:\s*)([^,\}\]]+?)(?=\s*[,\}\]]|$)')
+    text = val_pattern.sub(_quote_value, text)
 
-    # 6b) Quote complex unquoted expressions appearing as values
-    def _quote_expression(m: re.Match) -> str:
-        prefix, value = m.group(1), m.group(2)
-        v = value.strip()
-        # skip if already quoted/object/array
-        if v.startswith(('"', "'", "{", "[")):
-            return prefix + value
-        # JSON literals or numbers -> leave
-        if v in {"true", "false", "null"} or re.fullmatch(r"-?\d+(\.\d+)?([eE][+\-]?\d+)?", v):
-            return prefix + v
-        v = v.replace('"', '\\"')
-        return f'{prefix}"{v}"'
-    expr_pattern = re.compile(r'(:\s*)([^,\}\]]+)(?=\s*[,\}\]])')
-    text = expr_pattern.sub(_quote_expression, text)
-
-    # 7) Remove dangling commas
+    # 6) Remove dangling commas
     text = re.sub(r",\s*([\}\]])", r"\1", text)
     text = re.sub(r"([\{\[])\s*,\s*", r"\1", text)
 
-    # 8) Balance brackets with a stack
+    # 7) Balance brackets with a stack
     stack = []
     for ch in text:
         if ch == '{':
@@ -302,8 +321,25 @@ if __name__ == "__main__":
         result = from_str(test)
         print(f"Output: {result}")
         print(f"Type: {type(result)}")
-        assert isinstance(result, dict), (
-            f"Test {i + 1} failed: expected dict but got {type(result)}. Parsed value: {result}"
-        )
-        print("Type assertion passed (dict).")
+        
+        # Test-specific assertions
+        if i == 8:  # Test 9 (0-indexed)
+            assert isinstance(result, dict), f"Test {i + 1} failed: expected dict but got {type(result)}"
+            assert result.get("intent") == "divide"
+            assert result.get("reasoning") == "Now I need to perform the division."
+            assert result.get("numerator") == "314.97 + 1.32"  # Expression should be quoted as string
+            assert result.get("denominator") == 15.152
+        elif i == 19:  # Test 20
+            assert isinstance(result, dict), f"Test {i + 1} failed: expected dict but got {type(result)}"
+            assert result.get("active") == "TRUE"  # Should be string "TRUE", not boolean
+            assert result.get("off") == "FALSE"  # Should be string "FALSE", not boolean
+        elif i == 20:  # Test 21
+            assert isinstance(result, dict), f"Test {i + 1} failed: expected dict but got {type(result)}"
+            assert result.get("url") == "https://example.com"
+            assert result.get("email") == "test@example.com"
+        else:
+            assert isinstance(result, dict), (
+                f"Test {i + 1} failed: expected dict but got {type(result)}. Parsed value: {result}"
+            )
+        print("Assertions passed.")
 
